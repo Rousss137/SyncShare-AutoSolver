@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Smart LMS HSE + SyncShare AutoSolver
 // @namespace    http://tampermonkey.net/
-// @version      7.0
-// @description  Автовыбор ответов SyncShare (игнорирует false как выбор, отмечает только true у checkbox)
+// @version      8.0
+// @description  Точный автовыбор ответов SyncShare (читает индивидуальное меню каждого чекбокса)
 // @match        https://edu.hse.ru/mod/quiz/attempt.php*
 // @run-at       document-end
 // @inject-into  content
@@ -30,8 +30,10 @@
             .toLowerCase();
     }
 
-    function getAllShadowRoots(rootNode = document.documentElement) {
+    // Поиск ShadowRoot СТРОГО внутри переданного контейнера (без захвата document.body)
+    function getShadowRootsIn(container) {
         const roots = new Set();
+        if (!container) return [];
 
         function scanNode(node) {
             if (!node) return;
@@ -42,89 +44,125 @@
             }
         }
 
-        if (document.body) scanNode(document.body);
-        scanNode(rootNode);
-        rootNode.querySelectorAll('*').forEach(scanNode);
-
+        scanNode(container);
+        container.querySelectorAll('*').forEach(scanNode);
         return Array.from(roots);
     }
 
-    function clickWandInContainer(container) {
-        if (!container) return false;
-
-        const localRoots = getAllShadowRoots(container);
-        for (const r of localRoots) {
-            const target = r.querySelector('svg, button, [style*="cursor: pointer"], span, div');
-            if (target) {
-                target.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
-                if (target.parentElement) {
-                    target.parentElement.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
-                }
-                return true;
-            }
+    // Получение всех меню .syncshare-cm из ShadowRoot на body
+    function getAllSyncShareMenus() {
+        const bodyRoots = getShadowRootsIn(document.body);
+        const menus = [];
+        for (const r of bodyRoots) {
+            r.querySelectorAll('ul.syncshare-cm').forEach(m => menus.push(m));
         }
-
-        const candidates = Array.from(container.querySelectorAll('*')).reverse();
-        for (const el of candidates) {
-            if (el.tagName === 'INPUT' || el.tagName === 'LABEL' || el.classList.contains('answernumber')) continue;
-
-            const sr = el.openOrClosedShadowRoot || el.shadowRoot;
-            if (sr) {
-                const innerBtn = sr.querySelector('svg, button, span, div') || el;
-                innerBtn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
-                el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
-                return true;
-            }
-
-            if (el.tagName.toLowerCase() === 'svg') {
-                el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
-                if (el.parentElement) el.parentElement.click();
-                return true;
-            }
-        }
-
-        return false;
+        return menus;
     }
 
-    function getGreenStats() {
-        const roots = getAllShadowRoots(document.documentElement);
-        let menusCount = 0;
-        const greenAnswers = [];
+    // Принудительно скрываем все меню перед кликом по следующей палочке
+    function hideAllMenus() {
+        const menus = getAllSyncShareMenus();
+        for (const m of menus) {
+            m.setAttribute('hidden', '');
+            m.style.setProperty('display', 'none', 'important');
+        }
+    }
 
-        for (const root of roots) {
-            const menus = root.querySelectorAll('.syncshare-cm');
-            for (const menu of menus) {
-                menusCount++;
-                const topItems = menu.querySelectorAll(':scope > li.menu-item');
-                for (const item of topItems) {
-                    const label = item.querySelector(':scope > .item-label');
-                    if (!label || label.textContent.trim() !== 'Статистика') continue;
+    // Находим единственное меню, которое открылось после клика по палочке
+    function getCurrentlyOpenMenu() {
+        const menus = getAllSyncShareMenus();
+        for (const m of menus) {
+            const styleAttr = (m.getAttribute('style') || '').toLowerCase();
+            const isOpened = !m.hasAttribute('hidden') || styleAttr.includes('display: block');
+            if (isOpened) return m;
+        }
+        return null;
+    }
 
-                    const subItems = item.querySelectorAll(':scope > ul.sub-menu > li.menu-item');
-                    for (const sub of subItems) {
-                        const ansLabel = sub.querySelector('.item-label');
-                        const badge = sub.querySelector('.postfix .content');
-                        if (!ansLabel || !badge) continue;
+    // Извлекаем зеленые ответы из КОНКРЕТНОГО меню ul.syncshare-cm
+    function getGreenItemsFromMenu(menu) {
+        if (!menu) return [];
+        const results = [];
 
-                        const rawText = ansLabel.textContent.trim();
-                        const normText = normalizeText(rawText);
-                        const styleStr = (badge.getAttribute('style') || '').toLowerCase();
-                        const votes = parseInt(badge.textContent.trim(), 10) || 0;
+        const topItems = menu.querySelectorAll(':scope > li.menu-item');
+        for (const item of topItems) {
+            const label = item.querySelector(':scope > .item-label');
+            if (!label || label.textContent.trim() !== 'Статистика') continue;
 
-                        const isGreen =
-                            styleStr.includes('39, 153, 58') ||
-                            styleStr.includes('225, 238, 227');
+            const subItems = item.querySelectorAll(':scope > ul.sub-menu > li.menu-item');
+            for (const sub of subItems) {
+                const ansLabel = sub.querySelector('.item-label');
+                const badge = sub.querySelector('.postfix .content');
+                if (!ansLabel || !badge) continue;
 
-                        if (isGreen && normText) {
-                            greenAnswers.push({ rawText, normText, votes });
-                        }
-                    }
+                const rawText = ansLabel.textContent.trim();
+                const normText = normalizeText(rawText);
+                const styleStr = (badge.getAttribute('style') || '').toLowerCase();
+                const votes = parseInt(badge.textContent.trim(), 10) || 0;
+
+                const isGreen =
+                    styleStr.includes('39, 153, 58') ||
+                    styleStr.includes('225, 238, 227');
+
+                if (isGreen && normText) {
+                    results.push({ rawText, normText, votes });
                 }
             }
         }
 
-        greenAnswers.sort((a, b) => b.votes - a.votes);
-        return { rootsCount: roots.length, menusCount, greenAnswers };
+        results.sort((a, b) => b.votes - a.votes);
+        return results;
+    }
+
+    // Полноценный клик по элементу палочки с координатами
+    function triggerClick(el) {
+        if (!el) return;
+        const rect = el.getBoundingClientRect();
+        const opts = {
+            bubbles: true,
+            cancelable: true,
+            composed: true,
+            view: window,
+            clientX: rect.left + rect.width / 2,
+            clientY: rect.top + rect.height / 2
+        };
+        el.dispatchEvent(new MouseEvent('mousedown', opts));
+        el.dispatchEvent(new MouseEvent('mouseup', opts));
+        el.dispatchEvent(new MouseEvent('click', opts));
+    }
+
+    // Клик по иконке палочки строго внутри конкретного контейнера (строки ответа row)
+    function clickWandStrictlyIn(container) {
+        if (!container) return false;
+
+        // 1. Ищем ShadowRoot самой палочки внутри этой строки ответа
+        const rowRoots = getShadowRootsIn(container);
+        for (const r of rowRoots) {
+            if (r.querySelector('.syncshare-cm')) continue;
+            const btn = r.querySelector('svg, button, [style*="cursor: pointer"], span, div');
+            if (btn) {
+                triggerClick(btn);
+                return true;
+            }
+        }
+
+        // 2. Если палочка вставлена обычным элементом или хостом внутрь строки
+        const els = Array.from(container.querySelectorAll('*')).reverse();
+        for (const el of els) {
+            if (el.tagName === 'INPUT' || el.tagName === 'LABEL' || el.classList.contains('answernumber')) continue;
+            const sr = el.openOrClosedShadowRoot || el.shadowRoot;
+            if (sr && !sr.querySelector('.syncshare-cm')) {
+                const inner = sr.querySelector('svg, button, span, div') || el;
+                triggerClick(inner);
+                triggerClick(el);
+                return true;
+            }
+            if (el.tagName.toLowerCase() === 'svg') {
+                triggerClick(el);
+                return true;
+            }
+        }
+        return false;
     }
 
     function setRowHighlight(el, active) {
@@ -139,10 +177,10 @@
         }
     }
 
-    // Чекбоксы: ставим галочку ТОЛЬКО если в зеленой статистике есть true; false никогда не выбираем
+    // Решение вопроса с чекбоксами: проверяем индивидуальное меню каждой строки
     async function solveCheckboxesQuestion(q, checkboxes) {
         isSolving = true;
-        updateStatus('Проверяю варианты (true/false)...', '#3498db');
+        updateStatus('Проверяю каждый чекбокс...', '#3498db');
 
         let selectedCount = 0;
         const votesList = [];
@@ -151,63 +189,75 @@
             const cb = checkboxes[i];
             const row = cb.closest('div[class^="r"]') || cb.parentElement;
 
-            clickWandInContainer(row);
-            await sleep(220);
+            // Скрываем все меню перед кликом по палочке текущей строки
+            hideAllMenus();
+            await sleep(30);
 
-            const { greenAnswers } = getGreenStats();
+            // Кликаем по палочке ТОЛЬКО внутри текущей строки
+            clickWandStrictlyIn(row);
+            await sleep(90);
 
-            // Явно игнорируем false — это не вариант для выбора
-            const trueStat = greenAnswers.find(ga => ga.normText === 'true');
-            const hasOnlyFalse = greenAnswers.length > 0 && greenAnswers.every(ga => ga.normText === 'false');
+            // Берем ТОЛЬКО то меню, которое открылось от этого клика
+            const openMenu = getCurrentlyOpenMenu();
+            const greenItems = getGreenItemsFromMenu(openMenu);
 
-            if (trueStat && !hasOnlyFalse) {
+            // Ставим галочку ТОЛЬКО если в открытом меню этой строки написано "true"
+            const trueItem = greenItems.find(item => item.normText === 'true');
+
+            if (trueItem) {
                 if (!cb.checked) cb.click();
                 setRowHighlight(row, true);
                 selectedCount++;
-                votesList.push(trueStat.votes);
+                votesList.push(trueItem.votes);
             } else {
+                // Если там "false" или пусто — снимаем галочку и убираем подсветку
                 if (cb.checked) cb.click();
                 setRowHighlight(row, false);
             }
         }
 
-        const qtext = q.querySelector('.qtext');
-        if (qtext) qtext.dispatchEvent(new MouseEvent('click', { bubbles: true }));
-
+        // Прячем меню после обхода
+        hideAllMenus();
         isSolving = false;
 
         if (selectedCount > 0) {
             pageSolved = true;
-            updateStatus(`✅ Выбрано (true): ${selectedCount} (${votesList.join(', ')} гол.)`, '#27993a');
+            updateStatus(`✅ Выбрано: ${selectedCount} (${votesList.join(', ')} гол.)`, '#27993a');
             triggerAutoNextIfNeeded();
         } else {
             updateStatus('Варианты с true не найдены', '#e67e22');
         }
     }
 
+    // Решение одиночных вопросов (radio, текстовое поле, одиночный select)
     async function solveSingleQuestion(q) {
         isSolving = true;
 
-        let stats = getGreenStats();
-        if (stats.menusCount === 0 || stats.greenAnswers.length === 0) {
+        let menus = getAllSyncShareMenus();
+        if (menus.length === 0) {
             const formulation = q.querySelector('.formulation') || q;
-            clickWandInContainer(formulation);
-            await sleep(200);
-            stats = getGreenStats();
+            clickWandStrictlyIn(formulation);
+            await sleep(150);
+            menus = getAllSyncShareMenus();
         }
 
-        // Отфильтровываем технический "false", если он случайно попал в список
-        const validAnswers = stats.greenAnswers.filter(ga => ga.normText !== 'false');
-        if (validAnswers.length === 0) {
+        // Для одиночного вопроса берем открытое меню или единственное существующее
+        const targetMenu = getCurrentlyOpenMenu() || menus[0];
+        const greenItems = getGreenItemsFromMenu(targetMenu).filter(item => item.normText !== 'false');
+
+        hideAllMenus();
+
+        if (greenItems.length === 0) {
             isSolving = false;
             return;
         }
 
         let selected = 0;
+        const best = greenItems[0];
 
+        // 1. Одиночный выбор (radio)
         const radios = Array.from(q.querySelectorAll('.answer input[type="radio"]')).filter(r => r.value !== '-1');
         if (radios.length > 0) {
-            const best = validAnswers[0];
             for (const radio of radios) {
                 const row = radio.closest('div[class^="r"]') || radio.parentElement;
                 const labelEl = row.querySelector('[data-region="answer-label"] .flex-fill') ||
@@ -224,9 +274,9 @@
             }
         }
 
+        // 2. Ввод текста (shortanswer)
         const textInput = q.querySelector('.ablock input[type="text"], .answer input[type="text"]');
         if (textInput && !selected) {
-            const best = validAnswers[0];
             if (textInput.value !== best.rawText) {
                 textInput.value = best.rawText;
                 textInput.dispatchEvent(new Event('input', { bubbles: true }));
@@ -236,10 +286,10 @@
             selected = 1;
         }
 
+        // 3. Выпадающий список (<select>)
         const selects = Array.from(q.querySelectorAll('select'));
         if (selects.length === 1 && !selected) {
             const select = selects[0];
-            const best = validAnswers[0];
             for (const opt of select.options) {
                 const optText = normalizeText(opt.textContent);
                 if (optText && (optText === best.normText || optText.includes(best.normText) || best.normText.includes(optText))) {
@@ -258,8 +308,7 @@
 
         if (selected > 0) {
             pageSolved = true;
-            const votes = validAnswers.map(g => g.votes).join(', ');
-            updateStatus(`✅ Выбрано (${votes} гол.)`, '#27993a');
+            updateStatus(`✅ Выбрано (${best.votes} гол.)`, '#27993a');
             triggerAutoNextIfNeeded();
         }
     }
@@ -279,14 +328,15 @@
         const q = document.querySelector('.que');
         if (!q) return;
 
-        const { rootsCount, menusCount, greenAnswers } = getGreenStats();
-        if (debugEl) {
-            debugEl.textContent = `ShadowRoots: ${rootsCount} | Меню: ${menusCount} | Зеленых: ${greenAnswers.length}`;
+        const menus = getAllSyncShareMenus();
+        const checkboxes = Array.from(q.querySelectorAll('.answer input[type="checkbox"]'));
+
+        // Ждем, пока SyncShare создаст меню для всех вариантов
+        if (!force) {
+            if (checkboxes.length > 0 && menus.length < checkboxes.length) return;
+            if (checkboxes.length === 0 && menus.length === 0) return;
         }
 
-        if (rootsCount === 0 && !force) return;
-
-        const checkboxes = Array.from(q.querySelectorAll('.answer input[type="checkbox"]'));
         if (checkboxes.length > 0) {
             await solveCheckboxesQuestion(q, checkboxes);
         } else {
@@ -310,11 +360,11 @@
 
         statusEl = document.createElement('div');
         statusEl.style.cssText = 'padding:5px 8px;border-radius:4px;color:#fff;background:#2c3e50;font-weight:500;text-align:center;';
-        statusEl.textContent = 'SyncShare Solver v7.0';
+        statusEl.textContent = 'SyncShare Solver v8.0';
 
         debugEl = document.createElement('div');
         debugEl.style.cssText = 'font-size:11px;color:#555;text-align:center;';
-        debugEl.textContent = 'ShadowRoots: 0 | Меню: 0 | Зеленых: 0';
+        debugEl.textContent = 'Меню в памяти: 0';
 
         const solveBtn = document.createElement('button');
         solveBtn.textContent = '⚡ Проверить все ответы (Alt+Q)';
@@ -342,14 +392,14 @@
         document.body.appendChild(panel);
 
         setInterval(() => {
-            const { rootsCount, menusCount, greenAnswers } = getGreenStats();
+            const menus = getAllSyncShareMenus();
             if (debugEl) {
-                debugEl.textContent = `ShadowRoots: ${rootsCount} | Меню: ${menusCount} | Зеленых: ${greenAnswers.length}`;
+                debugEl.textContent = `Меню SyncShare на странице: ${menus.length}`;
             }
-            if (!pageSolved && !isSolving && rootsCount > 0) {
+            if (!pageSolved && !isSolving && menus.length > 0) {
                 runSolver(false);
             }
-        }, 300);
+        }, 250);
     }
 
     window.addEventListener('keydown', (e) => {
