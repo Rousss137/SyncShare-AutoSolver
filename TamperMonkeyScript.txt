@@ -1,0 +1,363 @@
+// ==UserScript==
+// @name         Smart LMS HSE + SyncShare AutoSolver
+// @namespace    http://tampermonkey.net/
+// @version      7.0
+// @description  Автовыбор ответов SyncShare (игнорирует false как выбор, отмечает только true у checkbox)
+// @match        https://edu.hse.ru/mod/quiz/attempt.php*
+// @run-at       document-end
+// @inject-into  content
+// @grant        none
+// ==/UserScript==
+
+(function () {
+    'use strict';
+
+    const AUTO_MODE_KEY = 'hse_syncshare_automode';
+    let isAutoMode = localStorage.getItem(AUTO_MODE_KEY) === 'true';
+    let statusEl = null;
+    let debugEl = null;
+    let isSolving = false;
+    let pageSolved = false;
+    let autoNextScheduled = false;
+
+    const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+    function normalizeText(str) {
+        return (str || '')
+            .replace(/^[a-zа-я0-9][\.\)]\s*/i, '')
+            .replace(/\s+/g, ' ')
+            .trim()
+            .toLowerCase();
+    }
+
+    function getAllShadowRoots(rootNode = document.documentElement) {
+        const roots = new Set();
+
+        function scanNode(node) {
+            if (!node) return;
+            const sr = node.openOrClosedShadowRoot || node.shadowRoot;
+            if (sr && !roots.has(sr)) {
+                roots.add(sr);
+                sr.querySelectorAll('*').forEach(scanNode);
+            }
+        }
+
+        if (document.body) scanNode(document.body);
+        scanNode(rootNode);
+        rootNode.querySelectorAll('*').forEach(scanNode);
+
+        return Array.from(roots);
+    }
+
+    function clickWandInContainer(container) {
+        if (!container) return false;
+
+        const localRoots = getAllShadowRoots(container);
+        for (const r of localRoots) {
+            const target = r.querySelector('svg, button, [style*="cursor: pointer"], span, div');
+            if (target) {
+                target.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+                if (target.parentElement) {
+                    target.parentElement.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+                }
+                return true;
+            }
+        }
+
+        const candidates = Array.from(container.querySelectorAll('*')).reverse();
+        for (const el of candidates) {
+            if (el.tagName === 'INPUT' || el.tagName === 'LABEL' || el.classList.contains('answernumber')) continue;
+
+            const sr = el.openOrClosedShadowRoot || el.shadowRoot;
+            if (sr) {
+                const innerBtn = sr.querySelector('svg, button, span, div') || el;
+                innerBtn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+                el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+                return true;
+            }
+
+            if (el.tagName.toLowerCase() === 'svg') {
+                el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+                if (el.parentElement) el.parentElement.click();
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    function getGreenStats() {
+        const roots = getAllShadowRoots(document.documentElement);
+        let menusCount = 0;
+        const greenAnswers = [];
+
+        for (const root of roots) {
+            const menus = root.querySelectorAll('.syncshare-cm');
+            for (const menu of menus) {
+                menusCount++;
+                const topItems = menu.querySelectorAll(':scope > li.menu-item');
+                for (const item of topItems) {
+                    const label = item.querySelector(':scope > .item-label');
+                    if (!label || label.textContent.trim() !== 'Статистика') continue;
+
+                    const subItems = item.querySelectorAll(':scope > ul.sub-menu > li.menu-item');
+                    for (const sub of subItems) {
+                        const ansLabel = sub.querySelector('.item-label');
+                        const badge = sub.querySelector('.postfix .content');
+                        if (!ansLabel || !badge) continue;
+
+                        const rawText = ansLabel.textContent.trim();
+                        const normText = normalizeText(rawText);
+                        const styleStr = (badge.getAttribute('style') || '').toLowerCase();
+                        const votes = parseInt(badge.textContent.trim(), 10) || 0;
+
+                        const isGreen =
+                            styleStr.includes('39, 153, 58') ||
+                            styleStr.includes('225, 238, 227');
+
+                        if (isGreen && normText) {
+                            greenAnswers.push({ rawText, normText, votes });
+                        }
+                    }
+                }
+            }
+        }
+
+        greenAnswers.sort((a, b) => b.votes - a.votes);
+        return { rootsCount: roots.length, menusCount, greenAnswers };
+    }
+
+    function setRowHighlight(el, active) {
+        if (!el) return;
+        if (active) {
+            el.style.outline = '2px solid #27993a';
+            el.style.backgroundColor = 'rgba(225, 238, 227, 0.73)';
+            el.style.borderRadius = '6px';
+        } else {
+            el.style.outline = '';
+            el.style.backgroundColor = '';
+        }
+    }
+
+    // Чекбоксы: ставим галочку ТОЛЬКО если в зеленой статистике есть true; false никогда не выбираем
+    async function solveCheckboxesQuestion(q, checkboxes) {
+        isSolving = true;
+        updateStatus('Проверяю варианты (true/false)...', '#3498db');
+
+        let selectedCount = 0;
+        const votesList = [];
+
+        for (let i = 0; i < checkboxes.length; i++) {
+            const cb = checkboxes[i];
+            const row = cb.closest('div[class^="r"]') || cb.parentElement;
+
+            clickWandInContainer(row);
+            await sleep(220);
+
+            const { greenAnswers } = getGreenStats();
+
+            // Явно игнорируем false — это не вариант для выбора
+            const trueStat = greenAnswers.find(ga => ga.normText === 'true');
+            const hasOnlyFalse = greenAnswers.length > 0 && greenAnswers.every(ga => ga.normText === 'false');
+
+            if (trueStat && !hasOnlyFalse) {
+                if (!cb.checked) cb.click();
+                setRowHighlight(row, true);
+                selectedCount++;
+                votesList.push(trueStat.votes);
+            } else {
+                if (cb.checked) cb.click();
+                setRowHighlight(row, false);
+            }
+        }
+
+        const qtext = q.querySelector('.qtext');
+        if (qtext) qtext.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+
+        isSolving = false;
+
+        if (selectedCount > 0) {
+            pageSolved = true;
+            updateStatus(`✅ Выбрано (true): ${selectedCount} (${votesList.join(', ')} гол.)`, '#27993a');
+            triggerAutoNextIfNeeded();
+        } else {
+            updateStatus('Варианты с true не найдены', '#e67e22');
+        }
+    }
+
+    async function solveSingleQuestion(q) {
+        isSolving = true;
+
+        let stats = getGreenStats();
+        if (stats.menusCount === 0 || stats.greenAnswers.length === 0) {
+            const formulation = q.querySelector('.formulation') || q;
+            clickWandInContainer(formulation);
+            await sleep(200);
+            stats = getGreenStats();
+        }
+
+        // Отфильтровываем технический "false", если он случайно попал в список
+        const validAnswers = stats.greenAnswers.filter(ga => ga.normText !== 'false');
+        if (validAnswers.length === 0) {
+            isSolving = false;
+            return;
+        }
+
+        let selected = 0;
+
+        const radios = Array.from(q.querySelectorAll('.answer input[type="radio"]')).filter(r => r.value !== '-1');
+        if (radios.length > 0) {
+            const best = validAnswers[0];
+            for (const radio of radios) {
+                const row = radio.closest('div[class^="r"]') || radio.parentElement;
+                const labelEl = row.querySelector('[data-region="answer-label"] .flex-fill') ||
+                                row.querySelector('[data-region="answer-label"]') ||
+                                row.querySelector('label') || row;
+                const optText = normalizeText(labelEl.textContent);
+
+                if (optText === best.normText || optText.includes(best.normText) || best.normText.includes(optText)) {
+                    if (!radio.checked) radio.click();
+                    setRowHighlight(row, true);
+                    selected = 1;
+                    break;
+                }
+            }
+        }
+
+        const textInput = q.querySelector('.ablock input[type="text"], .answer input[type="text"]');
+        if (textInput && !selected) {
+            const best = validAnswers[0];
+            if (textInput.value !== best.rawText) {
+                textInput.value = best.rawText;
+                textInput.dispatchEvent(new Event('input', { bubbles: true }));
+                textInput.dispatchEvent(new Event('change', { bubbles: true }));
+            }
+            setRowHighlight(textInput, true);
+            selected = 1;
+        }
+
+        const selects = Array.from(q.querySelectorAll('select'));
+        if (selects.length === 1 && !selected) {
+            const select = selects[0];
+            const best = validAnswers[0];
+            for (const opt of select.options) {
+                const optText = normalizeText(opt.textContent);
+                if (optText && (optText === best.normText || optText.includes(best.normText) || best.normText.includes(optText))) {
+                    if (select.value !== opt.value) {
+                        select.value = opt.value;
+                        select.dispatchEvent(new Event('change', { bubbles: true }));
+                    }
+                    setRowHighlight(select, true);
+                    selected = 1;
+                    break;
+                }
+            }
+        }
+
+        isSolving = false;
+
+        if (selected > 0) {
+            pageSolved = true;
+            const votes = validAnswers.map(g => g.votes).join(', ');
+            updateStatus(`✅ Выбрано (${votes} гол.)`, '#27993a');
+            triggerAutoNextIfNeeded();
+        }
+    }
+
+    function triggerAutoNextIfNeeded() {
+        if (isAutoMode && pageSolved && !autoNextScheduled) {
+            autoNextScheduled = true;
+            const nextBtn = document.querySelector('#mod_quiz-next-nav');
+            if (nextBtn) setTimeout(() => nextBtn.click(), 500);
+        }
+    }
+
+    async function runSolver(force = false) {
+        if (isSolving) return;
+        if (pageSolved && !force) return;
+
+        const q = document.querySelector('.que');
+        if (!q) return;
+
+        const { rootsCount, menusCount, greenAnswers } = getGreenStats();
+        if (debugEl) {
+            debugEl.textContent = `ShadowRoots: ${rootsCount} | Меню: ${menusCount} | Зеленых: ${greenAnswers.length}`;
+        }
+
+        if (rootsCount === 0 && !force) return;
+
+        const checkboxes = Array.from(q.querySelectorAll('.answer input[type="checkbox"]'));
+        if (checkboxes.length > 0) {
+            await solveCheckboxesQuestion(q, checkboxes);
+        } else {
+            await solveSingleQuestion(q);
+        }
+    }
+
+    function updateStatus(text, color = '#2c3e50') {
+        if (statusEl) {
+            statusEl.textContent = text;
+            statusEl.style.background = color;
+        }
+    }
+
+    function initPanel() {
+        if (document.getElementById('hse-syncshare-panel')) return;
+
+        const panel = document.createElement('div');
+        panel.id = 'hse-syncshare-panel';
+        panel.style.cssText = 'position:fixed;bottom:20px;right:20px;z-index:999999;background:#fff;border:1px solid #ccc;border-radius:8px;padding:10px;box-shadow:0 4px 12px rgba(0,0,0,0.15);font-family:Roboto,sans-serif;font-size:13px;display:flex;flex-direction:column;gap:6px;min-width:250px;';
+
+        statusEl = document.createElement('div');
+        statusEl.style.cssText = 'padding:5px 8px;border-radius:4px;color:#fff;background:#2c3e50;font-weight:500;text-align:center;';
+        statusEl.textContent = 'SyncShare Solver v7.0';
+
+        debugEl = document.createElement('div');
+        debugEl.style.cssText = 'font-size:11px;color:#555;text-align:center;';
+        debugEl.textContent = 'ShadowRoots: 0 | Меню: 0 | Зеленых: 0';
+
+        const solveBtn = document.createElement('button');
+        solveBtn.textContent = '⚡ Проверить все ответы (Alt+Q)';
+        solveBtn.style.cssText = 'padding:6px 10px;border:none;border-radius:4px;background:#0f6cbf;color:#fff;cursor:pointer;font-weight:500;';
+        solveBtn.onclick = () => runSolver(true);
+
+        const autoBtn = document.createElement('button');
+        const renderAutoBtn = () => {
+            autoBtn.textContent = isAutoMode ? '🤖 Авто-переход: ВКЛ' : '🤖 Авто-переход: ВЫКЛ';
+            autoBtn.style.background = isAutoMode ? '#27993a' : '#7f8c8d';
+        };
+        autoBtn.style.cssText = 'padding:6px 10px;border:none;border-radius:4px;color:#fff;cursor:pointer;font-weight:500;';
+        renderAutoBtn();
+        autoBtn.onclick = () => {
+            isAutoMode = !isAutoMode;
+            localStorage.setItem(AUTO_MODE_KEY, isAutoMode);
+            renderAutoBtn();
+            if (isAutoMode) {
+                if (pageSolved) triggerAutoNextIfNeeded();
+                else runSolver(true);
+            }
+        };
+
+        panel.append(statusEl, debugEl, solveBtn, autoBtn);
+        document.body.appendChild(panel);
+
+        setInterval(() => {
+            const { rootsCount, menusCount, greenAnswers } = getGreenStats();
+            if (debugEl) {
+                debugEl.textContent = `ShadowRoots: ${rootsCount} | Меню: ${menusCount} | Зеленых: ${greenAnswers.length}`;
+            }
+            if (!pageSolved && !isSolving && rootsCount > 0) {
+                runSolver(false);
+            }
+        }, 300);
+    }
+
+    window.addEventListener('keydown', (e) => {
+        if (e.altKey && (e.code === 'KeyQ' || e.key === 'q' || e.key === 'й')) {
+            e.preventDefault();
+            runSolver(true);
+        }
+    });
+
+    initPanel();
+})();
